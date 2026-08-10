@@ -12,6 +12,9 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.utils import broadcast_pyobj
+
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,7 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
         self,
         backend: ContinuousDiffusionBackend[StateT],
         *,
+        tp_group: GroupCoordinator,
         max_batch_size: int = 1,
         max_running_requests: int | None = None,
         max_batch_wait_ms: int = 0,
@@ -74,7 +78,12 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
     ) -> None:
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
-        self.requires_tp_work_fanout: bool = True
+        self.requires_tp_work_fanout: bool = False
+
+        self.tp_group = tp_group
+        self.tp_rank = tp_group.rank_in_group
+        self.tp_size = tp_group.world_size
+        self.is_entry_rank = self.tp_rank == 0
 
         self._backend = backend
         self._max_batch_size = max(int(max_batch_size), 1)
@@ -147,18 +156,35 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
             self._aborted.discard(request_id)
 
     def _drain_messages(self, *, block: bool) -> None:
+        messages = self._drain_local_inbox(block=block) if self.is_entry_rank else []
+        for message in self._broadcast_messages(messages):
+            self._handle_message(message)
+
+    def _drain_local_inbox(self, *, block: bool) -> list[IncomingMessage]:
+        messages: list[IncomingMessage] = []
         if block:
             try:
-                self._handle_message(self.inbox.get(timeout=0.05))
+                messages.append(self.inbox.get(timeout=0.05))
             except _queue_mod.Empty:
-                return
+                return messages
 
         while True:
             try:
-                message = self.inbox.get_nowait()
+                messages.append(self.inbox.get_nowait())
             except _queue_mod.Empty:
-                return
-            self._handle_message(message)
+                return messages
+
+    def _broadcast_messages(
+        self, messages: list[IncomingMessage]
+    ) -> list[IncomingMessage]:
+        if self.tp_size == 1:
+            return messages
+        return broadcast_pyobj(
+            messages,
+            self.tp_group.rank,
+            self.tp_group.cpu_group,
+            src=self.tp_group.ranks[0],
+        )
 
     def _handle_message(self, message: IncomingMessage) -> None:
         if message.type != "new_request":
@@ -204,15 +230,21 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
     def _wait_for_initial_batch(self) -> None:
         if self._max_batch_wait_s <= 0:
             return
-        deadline = time.monotonic() + self._max_batch_wait_s
-        while len(self._waiting) < self._max_running_requests:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            try:
-                message = self.inbox.get(timeout=remaining)
-            except _queue_mod.Empty:
-                return
+
+        messages: list[IncomingMessage] = []
+        if self.is_entry_rank:
+            deadline = time.monotonic() + self._max_batch_wait_s
+            available_slots = self._max_running_requests - len(self._waiting)
+            while len(messages) < available_slots:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    messages.append(self.inbox.get(timeout=remaining))
+                except _queue_mod.Empty:
+                    break
+
+        for message in self._broadcast_messages(messages):
             self._handle_message(message)
 
     def _purge_aborted(self) -> None:
@@ -347,13 +379,7 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
 
             self._resident.pop(request.request_id, None)
             if not self._is_aborted(request.request_id):
-                self.outbox.put(
-                    OutgoingMessage(
-                        request_id=request.request_id,
-                        type="result",
-                        data=result,
-                    )
-                )
+                self._emit_result(request.request_id, result)
             self._release(request)
             self._clear_aborted(request.request_id)
 
@@ -366,7 +392,16 @@ class ContinuousDiffusionScheduler(Generic[StateT]):
         self._release(request)
         self._clear_aborted(request.request_id)
 
+    def _emit_result(self, request_id: str, result: Any) -> None:
+        if not self.is_entry_rank:
+            return
+        self.outbox.put(
+            OutgoingMessage(request_id=request_id, type="result", data=result)
+        )
+
     def _emit_error(self, request_id: str, error: BaseException) -> None:
+        if not self.is_entry_rank:
+            return
         self.outbox.put(
             OutgoingMessage(
                 request_id=request_id,

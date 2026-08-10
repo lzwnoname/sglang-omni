@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import queue
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
+from sglang_omni.scheduling import continuous_diffusion_scheduler as scheduler_module
 from sglang_omni.scheduling.continuous_diffusion_scheduler import (
     ContinuousDiffusionScheduler,
 )
@@ -54,6 +57,30 @@ class _Backend:
         self.released.append(state.name)
 
 
+def _tp_group(rank: int = 0, world_size: int = 1) -> SimpleNamespace:
+    return SimpleNamespace(
+        rank=rank,
+        rank_in_group=rank,
+        world_size=world_size,
+        ranks=list(range(world_size)),
+        cpu_group=object(),
+    )
+
+
+def _scheduler(
+    backend: _Backend,
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    **kwargs: Any,
+) -> ContinuousDiffusionScheduler:
+    return ContinuousDiffusionScheduler(
+        backend,
+        tp_group=_tp_group(rank=tp_rank, world_size=tp_size),
+        **kwargs,
+    )
+
+
 def _message(request_id: str, **payload: Any) -> IncomingMessage:
     return IncomingMessage(
         request_id=request_id,
@@ -64,7 +91,7 @@ def _message(request_id: str, **payload: Any) -> IncomingMessage:
 
 def test_scheduler_batches_compatible_states_and_round_robins_batch_keys() -> None:
     backend = _Backend()
-    scheduler = ContinuousDiffusionScheduler(
+    scheduler = _scheduler(
         backend,
         max_batch_size=2,
         max_running_requests=3,
@@ -95,9 +122,63 @@ def test_scheduler_batches_compatible_states_and_round_robins_batch_keys() -> No
     assert sorted(backend.released) == ["image-a", "image-b", "video"]
 
 
+def test_tp_leader_owns_ingress_batch_wait_and_output(monkeypatch) -> None:
+    broadcast_payload: list[Any] | None = None
+
+    def replay_broadcast(data, rank, _group, *, src):
+        nonlocal broadcast_payload
+        if rank == src:
+            broadcast_payload = deepcopy(data)
+        assert broadcast_payload is not None
+        return deepcopy(broadcast_payload)
+
+    monkeypatch.setattr(scheduler_module, "broadcast_pyobj", replay_broadcast)
+
+    leader = _scheduler(
+        _Backend(),
+        tp_rank=0,
+        tp_size=2,
+        max_running_requests=2,
+        max_batch_wait_ms=20,
+    )
+    follower = _scheduler(
+        _Backend(),
+        tp_rank=1,
+        tp_size=2,
+        max_running_requests=2,
+        max_batch_wait_ms=20,
+    )
+    assert not leader.requires_tp_work_fanout
+
+    leader.inbox.put(_message("first"))
+    leader._drain_messages(block=False)
+    follower._drain_messages(block=False)
+    assert (
+        [request.request_id for request in leader._waiting]
+        == [request.request_id for request in follower._waiting]
+        == ["first"]
+    )
+
+    leader.inbox.put(_message("late"))
+    leader._wait_for_initial_batch()
+    follower._wait_for_initial_batch()
+    assert (
+        [request.request_id for request in leader._waiting]
+        == [request.request_id for request in follower._waiting]
+        == ["first", "late"]
+    )
+
+    leader._emit_result("first", "leader-result")
+    leader._emit_error("late", RuntimeError("leader-error"))
+    follower._emit_result("first", "follower-result")
+    follower._emit_error("late", RuntimeError("follower-error"))
+    assert [leader.outbox.get_nowait().type for _ in range(2)] == ["result", "error"]
+    assert follower.outbox.empty()
+
+
 def test_scheduler_applies_batch_cost_without_starving_large_requests() -> None:
     backend = _Backend()
-    scheduler = ContinuousDiffusionScheduler(
+    scheduler = _scheduler(
         backend,
         max_batch_size=3,
         max_running_requests=3,
@@ -122,7 +203,7 @@ def test_scheduler_applies_batch_cost_without_starving_large_requests() -> None:
 
 def test_prepare_error_is_isolated_from_other_requests() -> None:
     backend = _Backend()
-    scheduler = ContinuousDiffusionScheduler(
+    scheduler = _scheduler(
         backend,
         max_batch_size=2,
         max_running_requests=2,
@@ -153,7 +234,7 @@ class _FailFirstStepBackend(_Backend):
 
 def test_batch_step_error_releases_batch_and_scheduler_keeps_serving() -> None:
     backend = _FailFirstStepBackend()
-    scheduler = ContinuousDiffusionScheduler(
+    scheduler = _scheduler(
         backend,
         max_batch_size=2,
         max_running_requests=2,
@@ -194,7 +275,7 @@ class _BlockingBackend(_Backend):
 
 def test_abort_during_model_step_suppresses_result_and_releases_state() -> None:
     backend = _BlockingBackend()
-    scheduler = ContinuousDiffusionScheduler(backend)
+    scheduler = _scheduler(backend)
     thread = threading.Thread(target=scheduler.start, daemon=True)
     thread.start()
     try:
