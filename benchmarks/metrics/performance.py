@@ -47,6 +47,11 @@ Metric semantics:
 ``c50`` / ``c100`` / ``c200``
     Percent of multi-chunk successful requests whose max underrun is at most
     50 / 100 / 200 ms.
+``playback_continuity_requests`` / ``playback_continuity_na_requests``
+    Scored versus single-chunk requests behind the ``c*`` gates. Utterances that
+    finish inside the first vocoder chunk are single-chunk and land in the N/A
+    bucket. All playback-continuity fields above are emitted only for workloads
+    that stream audio chunks, so text-only ASR/Omni results stay unchanged.
 ``audio_chunks_mean``
     Mean number of audio chunks observed per successful streaming request.
     For raw PCM streaming, HTTP chunk boundaries are preserved when available
@@ -143,6 +148,11 @@ def compute_speed_metrics(
         for o in successes
         if getattr(o, "first_audio_payload_bytes", 0) > 0
     ]
+    streaming_audio_underruns = [
+        getattr(o, "max_playback_underrun_s", None)
+        for o in successes
+        if getattr(o, "chunk_audio_duration_s", None)
+    ]
 
     if wall_clock_s is not None and wall_clock_s > 0:
         throughput = round(len(successes) / wall_clock_s, 3)
@@ -213,11 +223,8 @@ def compute_speed_metrics(
         metrics_summary["first_audio_payload_bytes_p95"] = round(
             float(np.percentile(first_payload_bytes, 95)), 1
         )
-    metrics_summary.update(
-        summarize_playback_continuity(
-            [getattr(o, "max_playback_underrun_s", None) for o in successes]
-        )
-    )
+    if streaming_audio_underruns:
+        metrics_summary.update(summarize_playback_continuity(streaming_audio_underruns))
     return metrics_summary
 
 
@@ -279,6 +286,12 @@ def print_speed_summary(
     print_speed_metric_line(lw, "C200 (%):", metrics, "c200")
     print_speed_metric_line(
         lw, "Continuity requests:", metrics, "playback_continuity_requests"
+    )
+    print_speed_metric_line(
+        lw,
+        "Continuity N/A (1 chunk):",
+        metrics,
+        "playback_continuity_na_requests",
     )
     print_speed_metric_line(lw, "Audio chunks mean:", metrics, "audio_chunks_mean")
     print_speed_metric_line(

@@ -193,6 +193,8 @@ non-streaming.
 When `initial_codec_chunk_frames` is omitted, Qwen3-TTS Base defaults to `8`
 codec frames for the first vocoder chunk so concurrent streams stay continuous.
 Pass a smaller value only when trading continuity for lower time-to-first-audio.
+Utterances that finish in fewer than `8` generated codec frames never reach the
+first chunk, so their audio arrives complete in a single final flush.
 
 ## Generation Parameters
 

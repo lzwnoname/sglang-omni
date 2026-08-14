@@ -1563,10 +1563,13 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler._on_streaming_new_request(payload.request_id, payload)
 
+    initial_frames = scheduler._default_initial_chunk_frames
+    assert initial_frames < scheduler._stream_stride
+
     scheduler._on_chunk(
         payload.request_id,
         _qwen3_tts_stream_item(
-            torch.ones((1, 2), dtype=torch.long),
+            torch.ones((initial_frames, 2), dtype=torch.long),
             chunk_id=0,
             ref_code_len=0,
         ),
@@ -1574,7 +1577,7 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     assert scheduler.outbox.qsize() == 1
 
     first = scheduler.outbox.get_nowait()
-    assert len(first.data["audio_waveform"]) == 1 * 4 * 4
+    assert len(first.data["audio_waveform"]) == initial_frames * 4 * 4
 
     scheduler._on_chunk(
         payload.request_id,
@@ -1597,22 +1600,23 @@ def test_qwen3_tts_streaming_vocoder_uses_steady_followup_stride() -> None:
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler._on_streaming_new_request(payload.request_id, payload)
 
+    initial_frames = scheduler._default_initial_chunk_frames
     scheduler._on_chunk(
         payload.request_id,
         _qwen3_tts_stream_item(
-            torch.ones((1, 2), dtype=torch.long),
+            torch.ones((initial_frames, 2), dtype=torch.long),
             chunk_id=0,
             ref_code_len=0,
         ),
     )
     state = scheduler._stream_states[payload.request_id]
-    assert state.next_decode_generated_frames == 9
+    assert state.next_decode_generated_frames == initial_frames + 8
 
     scheduler._on_chunk(
         payload.request_id,
         _qwen3_tts_stream_item(torch.ones((8, 2), dtype=torch.long), chunk_id=1),
     )
-    assert state.next_decode_generated_frames == 17
+    assert state.next_decode_generated_frames == initial_frames + 16
     assert len(scheduler._decoder.decode_inputs) == 2
 
 
@@ -1641,6 +1645,58 @@ def test_qwen3_tts_streaming_vocoder_zero_initial_chunk_uses_steady_stride() -> 
         _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
     )
     assert scheduler.outbox.qsize() == 1
+
+
+def test_qwen3_tts_streaming_vocoder_short_utterance_flushes_complete_audio() -> None:
+    """A stream ending before the initial chunk still delivers every sample.
+
+    Utterances that reach EOS with fewer than ``initial_chunk_frames`` generated
+    frames emit no streaming chunk, so the final flush carries the whole
+    waveform in one piece. Those requests are single-chunk and therefore N/A for
+    the C50/C100/C200 gates, which is why the benchmark reports the N/A count.
+    """
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+    generated_frames = scheduler._default_initial_chunk_frames - 1
+    assert generated_frames > 0
+    ref_frames = 2
+    total_frames = ref_frames + generated_frames
+    all_codes = torch.arange(1, total_frames * 2 + 1, dtype=torch.long).reshape(
+        total_frames, 2
+    )
+
+    payload = make_payload(inputs="target", params={"stream": True})
+    payload.data = Qwen3TTSState(
+        audio_codes=all_codes,
+        ref_code_len=ref_frames,
+        prompt_tokens=2,
+        completion_tokens=generated_frames,
+    ).to_dict()
+
+    scheduler._on_streaming_new_request(payload.request_id, payload)
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(all_codes, chunk_id=0, ref_code_len=ref_frames),
+    )
+    assert scheduler.outbox.qsize() == 0
+
+    scheduler._on_done(payload.request_id)
+    messages = []
+    while not scheduler.outbox.empty():
+        messages.append(scheduler.outbox.get_nowait())
+
+    stream_messages = [message for message in messages if message.type == "stream"]
+    assert len(stream_messages) == 1
+    stream_audio = np.frombuffer(
+        stream_messages[0].data["audio_waveform"],
+        dtype=np.float32,
+    )
+    expected = all_codes[ref_frames:, 0].to(torch.float32).repeat_interleave(4).numpy()
+    np.testing.assert_array_equal(stream_audio, expected)
+    assert any(message.type == "result" for message in messages)
+    assert payload.request_id not in scheduler._stream_states
 
 
 def test_qwen3_tts_stream_output_prepends_reference_once() -> None:
@@ -2058,6 +2114,7 @@ def test_qwen3_tts_async_worker_propagates_process_exit(
         device="cpu",
         stream_stride=1,
         stream_followup_stride=1,
+        initial_chunk_frames=1,
     )
     state = scheduler.create_stream_state("request")
     state.num_quantizers = 2
@@ -2089,6 +2146,7 @@ def test_qwen3_tts_async_commit_propagates_process_exit(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
         stream_stride=1,
+        initial_chunk_frames=1,
     )
     state = scheduler.create_stream_state("request")
     state.num_quantizers = 2

@@ -70,6 +70,7 @@ def test_compute_speed_metrics_includes_continuity_gates() -> None:
             audio_duration_s=1.0,
             rtf=1.0,
             audio_ttfp_s=0.1,
+            chunk_audio_duration_s=[1.0],
             max_playback_underrun_s=None,
             audio_chunk_count=1,
         ),
@@ -95,3 +96,67 @@ def test_compute_speed_metrics_includes_continuity_gates() -> None:
     assert metrics["c100"] == pytest.approx(50.0)
     assert metrics["c200"] == pytest.approx(50.0)
     assert metrics["max_playback_underrun_mean_s"] == pytest.approx(0.135)
+
+
+_CONTINUITY_KEYS = (
+    "playback_continuity_requests",
+    "playback_continuity_na_requests",
+    "max_playback_underrun_mean_s",
+    "max_playback_underrun_p95_s",
+    "max_playback_underrun_p99_s",
+    "c50",
+    "c100",
+    "c200",
+)
+
+
+def test_compute_speed_metrics_skips_continuity_for_non_streaming_audio() -> None:
+    """ASR/Omni workloads share compute_speed_metrics and emit no audio chunks."""
+    outputs = [
+        RequestResult(
+            request_id="asr-1",
+            is_success=True,
+            latency_s=1.0,
+            audio_duration_s=1.0,
+            rtf=1.0,
+        ),
+        RequestResult(
+            request_id="asr-2",
+            is_success=True,
+            latency_s=2.0,
+            audio_duration_s=2.0,
+            rtf=1.0,
+        ),
+    ]
+
+    metrics = compute_speed_metrics(outputs, wall_clock_s=2.0)
+
+    assert metrics["completed_requests"] == 2
+    for key in _CONTINUITY_KEYS:
+        assert key not in metrics
+
+
+def test_compute_speed_metrics_reports_all_single_chunk_streams() -> None:
+    """Short utterances stay visible as N/A instead of dropping the gate."""
+    outputs = [
+        RequestResult(
+            request_id=f"short-{index}",
+            is_success=True,
+            latency_s=1.0,
+            audio_duration_s=0.5,
+            rtf=2.0,
+            audio_ttfp_s=0.4,
+            chunk_audio_duration_s=[0.5],
+            max_playback_underrun_s=None,
+            audio_chunk_count=1,
+        )
+        for index in range(3)
+    ]
+
+    metrics = compute_speed_metrics(outputs, wall_clock_s=1.0)
+
+    assert metrics["playback_continuity_requests"] == 0
+    assert metrics["playback_continuity_na_requests"] == 3
+    assert metrics["c50"] is None
+    assert metrics["c100"] is None
+    assert metrics["c200"] is None
