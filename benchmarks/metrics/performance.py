@@ -50,8 +50,12 @@ Metric semantics:
 ``playback_continuity_requests`` / ``playback_continuity_na_requests``
     Scored versus single-chunk requests behind the ``c*`` gates. Utterances that
     finish inside the first vocoder chunk are single-chunk and land in the N/A
-    bucket. All playback-continuity fields above are emitted only for workloads
-    that stream audio chunks, so text-only ASR/Omni results stay unchanged.
+    bucket. Every playback-continuity field above is summary-level and is emitted
+    only for workloads that stream audio chunks, so ASR/Omni summaries are
+    unaffected. Per-request rows are separate: ``_request_result_to_dict`` is a
+    fixed-schema serializer, so ``chunk_audio_duration_s`` and
+    ``max_playback_underrun_s`` appear there as ``None`` on non-streaming rows,
+    exactly like ``audio_ttfp_s`` / ``inter_chunk_s`` / ``audio_chunk_count``.
 ``audio_chunks_mean``
     Mean number of audio chunks observed per successful streaming request.
     For raw PCM streaming, HTTP chunk boundaries are preserved when available
